@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"code.google.com/p/gosshold/ssh"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -14,19 +13,42 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"code.google.com/p/gosshold/ssh"
 )
 
-const (
-	DEFAULT_TIMEOUT               = 30000 // default timeout for operations (in milliseconds)
-	CHUNK_SIZE                    = 65536 // chunk size in bytes for scp
-	THROUGHPUT_SLEEP_INTERVAL     = 100   // how many milliseconds to sleep between writing "tickets" to channel in maxThroughputThread
-	MIN_CHUNKS                    = 10    // minimum allowed count of chunks to be sent per sleep interval
-	MIN_THROUGHPUT                = CHUNK_SIZE * MIN_CHUNKS * (1000 / THROUGHPUT_SLEEP_INTERVAL)
-	MAX_OPENSSH_AGENT_CONNECTIONS = 128 // default connection backlog for openssh
+func environGet(key string, otherwise string) (value int) {
+	v := os.Getenv(key)
+	if v == "" {
+		v = otherwise
+	}
+	var err error
+	value, err = strconv.Atoi(v)
+	if err != nil {
+		fmt.Println("environGet::error = ", err)
+	}
+	return
+}
+
+var (
+	// default timeout for operations (in milliseconds)
+	defaultTimeout             = environGet("DEFAULT_TIMEOUT", "30000")
+	// chunk size in bytes for scp
+	chunkSize                  = environGet("CHUNK_SIZE", "65536")
+	// how many milliseconds to sleep between writing "tickets" to channel in maxThroughputThread
+	thoughputSleepInterval     = environGet("THROUGHPUT_SLEEP_INTERVAL", "100")
+	// minimum allowed count of chunks to be sent per sleep interval
+	minChunks                  = environGet("MIN_CHUNKS", "10")
+	minThroughput              = environGet("MIN_THROUGHPUT",
+		strconv.Itoa(chunkSize*minChunks*(1000/thoughputSleepInterval)))
+	// default connection backlog for openssh
+	maxOpensshAgentConnections = environGet("MAX_OPENSSH_AGENT_CONNECTIONS", "128")
 )
 
 var (
@@ -37,8 +59,8 @@ var (
 	connectedHostsMutex sync.Mutex
 	repliesChan         = make(chan interface{})
 	requestsChan        = make(chan *ProxyRequest)
-	maxThroughputChan   = make(chan bool, MIN_CHUNKS) // channel that is used for throughput limiting in scp
-	maxThroughput       uint64                        // max throughput (for scp) in bytes per second
+	maxThroughputChan   = make(chan bool, minChunks) // channel that is used for throughput limiting in scp
+	maxThroughput       uint64                       // max throughput (for scp) in bytes per second
 	maxThroughputMutex  sync.Mutex
 	agentConnChan       = make(chan chan bool) // channel for getting "ticket" for new agent connection
 	agentConnFreeChan   = make(chan bool, 10)  // channel for freeing connections
@@ -46,23 +68,27 @@ var (
 )
 
 type (
+	// SignerContainer holds the signers and client key-ring
 	SignerContainer struct {
 		signers []ssh.Signer
 		agentKr ssh.ClientKeyring
 	}
 
-	SshResult struct {
+	// SSHResult contains the result from an SSH session
+	SSHResult struct {
 		hostname string
 		stdout   string
 		stderr   string
 		err      error
 	}
 
+	// ScpResult contains hostname and err
 	ScpResult struct {
 		hostname string
 		err      error
 	}
 
+	// ProxyRequest is a struct with attributed for establishing requests through a proxy.
 	ProxyRequest struct {
 		Action        string
 		Password      string // password for private key (only for Action == "password")
@@ -70,10 +96,11 @@ type (
 		Source        string // source file to copy (only for Action == "scp")
 		Target        string // target file (only for Action == "scp")
 		Hosts         []string
-		Timeout       uint64 // timeout (in milliseconds), default is DEFAULT_TIMEOUT
+		Timeout       uint64 // timeout (in milliseconds), default is defaultTimeout
 		MaxThroughput uint64 // max throughput (for scp) in bytes per second, default is no limit
 	}
 
+	// Reply is a struct with the response
 	Reply struct {
 		Hostname string
 		Stdout   string
@@ -82,32 +109,40 @@ type (
 		ErrMsg   string
 	}
 
+	// PasswordRequest holds a PasswordFor string
 	PasswordRequest struct {
 		PasswordFor string
 	}
 
+	// FinalReply holds the total time and a map of timed out hosts
 	FinalReply struct {
 		TotalTime     float64
 		TimedOutHosts map[string]bool
 	}
 
+	// ConnectionProgress shows progress on specific connected host
 	ConnectionProgress struct {
 		ConnectedHost string
 	}
 
+	// UserError holds the user error
 	UserError struct {
 		IsCritical bool
 		ErrorMsg   string
 	}
 
+	// InitializeComplete is a simple boolean struct
 	InitializeComplete struct {
 		InitializeComplete bool
 	}
 
+	// DisableReportConnectedHosts bool
 	DisableReportConnectedHosts bool
-	EnableReportConnectedHosts  bool
+	// EnableReportConnectedHosts bool
+	EnableReportConnectedHosts bool
 )
 
+// Key takes an int and returns public_key, err
 func (t *SignerContainer) Key(i int) (key ssh.PublicKey, err error) {
 	if i < len(t.signers) {
 		key = t.signers[i].PublicKey()
@@ -118,6 +153,7 @@ func (t *SignerContainer) Key(i int) (key ssh.PublicKey, err error) {
 	return
 }
 
+// Sign takes an int, io.Reader and []byte then returns signature, err
 func (t *SignerContainer) Sign(i int, rand io.Reader, data []byte) (sig []byte, err error) {
 	if i < len(t.signers) {
 		sig, err = t.signers[i].Sign(rand, data)
@@ -362,10 +398,10 @@ func uploadFile(target string, contents []byte, hostname string) (stdout, stderr
 		return
 	}
 
-	for start, maxEnd := 0, len(contents); start < maxEnd; start += CHUNK_SIZE {
+	for start, maxEnd := 0, len(contents); start < maxEnd; start += chunkSize {
 		<-maxThroughputChan
 
-		end := start + CHUNK_SIZE
+		end := start + chunkSize
 		if end > maxEnd {
 			end = maxEnd
 		}
@@ -443,10 +479,14 @@ func initialize() {
 
 	flag.StringVar(&pubKey, "i", "", "Optional path to public key to use")
 	flag.StringVar(&user, "l", os.Getenv("LOGNAME"), "Optional login name")
-	flag.IntVar(&maxAgentConnections, "c", MAX_OPENSSH_AGENT_CONNECTIONS, "Maximum simultaneous ssh-agent connections")
+	flag.IntVar(&maxAgentConnections, "c", maxOpensshAgentConnections, "Maximum simultaneous ssh-agent connections")
 	flag.Parse()
 
-	keys = []string{os.Getenv("HOME") + "/.ssh/id_rsa", os.Getenv("HOME") + "/.ssh/id_dsa", os.Getenv("HOME") + "/.ssh/id_ecdsa"}
+	sshHome := path.Join(os.Getenv("HOME"), ".ssh")
+	keys = []string{
+		path.Join(sshHome, "id_rsa"),
+		path.Join(sshHome, "id_dsa"),
+		path.Join(sshHome, "id_ecdsa")}
 
 	if pubKey != "" {
 		if strings.HasSuffix(pubKey, ".pub") {
@@ -523,10 +563,10 @@ func maxThroughputThread() {
 		maxThroughputMutex.Unlock()
 
 		// how many chunks can be sent in specified time interval
-		chunks := throughput / CHUNK_SIZE * THROUGHPUT_SLEEP_INTERVAL / 1000
+		chunks := throughput / uint64(chunkSize) * uint64(thoughputSleepInterval) / 1000
 
-		if chunks < MIN_CHUNKS {
-			chunks = MIN_CHUNKS
+		if chunks < uint64(minChunks) {
+			chunks = uint64(minChunks)
 		}
 
 		for i := uint64(0); i < chunks; i++ {
@@ -534,13 +574,13 @@ func maxThroughputThread() {
 		}
 
 		if throughput > 0 {
-			time.Sleep(THROUGHPUT_SLEEP_INTERVAL * time.Millisecond)
+			time.Sleep(time.Duration(thoughputSleepInterval) * time.Millisecond)
 		}
 	}
 }
 
 func runAction(msg *ProxyRequest) {
-	var executeFunc func(string) *SshResult
+	var executeFunc func(string) *SSHResult
 
 	if msg.Action == "ssh" {
 		if msg.Cmd == "" {
@@ -548,9 +588,9 @@ func runAction(msg *ProxyRequest) {
 			return
 		}
 
-		executeFunc = func(hostname string) *SshResult {
+		executeFunc = func(hostname string) *SSHResult {
 			stdout, stderr, err := executeCmd(msg.Cmd, hostname)
-			return &SshResult{hostname: hostname, stdout: stdout, stderr: stderr, err: err}
+			return &SSHResult{hostname: hostname, stdout: stdout, stderr: stderr, err: err}
 		}
 	} else if msg.Action == "scp" {
 		if msg.Source == "" {
@@ -563,8 +603,8 @@ func runAction(msg *ProxyRequest) {
 			return
 		}
 
-		if msg.MaxThroughput > 0 && msg.MaxThroughput < MIN_THROUGHPUT {
-			reportErrorToUser(fmt.Sprint("Minimal supported throughput is ", MIN_THROUGHPUT, " Bps"))
+		if msg.MaxThroughput > 0 && msg.MaxThroughput < uint64(minThroughput) {
+			reportErrorToUser(fmt.Sprint("Minimal supported throughput is ", minThroughput, " Bps"))
 		}
 
 		maxThroughputMutex.Lock()
@@ -585,13 +625,13 @@ func runAction(msg *ProxyRequest) {
 			return
 		}
 
-		executeFunc = func(hostname string) *SshResult {
+		executeFunc = func(hostname string) *SSHResult {
 			stdout, stderr, err := uploadFile(msg.Target, contents, hostname)
-			return &SshResult{hostname: hostname, stdout: stdout, stderr: stderr, err: err}
+			return &SSHResult{hostname: hostname, stdout: stdout, stderr: stderr, err: err}
 		}
 	}
 
-	timeout := uint64(DEFAULT_TIMEOUT)
+	timeout := uint64(defaultTimeout)
 
 	if msg.Timeout > 0 {
 		timeout = msg.Timeout
@@ -599,7 +639,7 @@ func runAction(msg *ProxyRequest) {
 
 	startTime := time.Now().UnixNano()
 
-	responseChannel := make(chan *SshResult, 10)
+	responseChannel := make(chan *SSHResult, 10)
 	timeoutChannel := time.After(time.Millisecond * time.Duration(timeout))
 
 	timedOutHosts := make(map[string]bool)
@@ -633,7 +673,7 @@ func runAction(msg *ProxyRequest) {
 finish:
 
 	connectedHostsMutex.Lock()
-	for hostname, _ := range timedOutHosts {
+	for hostname := range timedOutHosts {
 		if conn, ok := connectedHosts[hostname]; ok {
 			conn.Close()
 		}
@@ -685,3 +725,4 @@ func main() {
 	sendProxyReply(&InitializeComplete{InitializeComplete: true})
 	runProxy()
 }
+
